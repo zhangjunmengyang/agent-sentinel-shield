@@ -244,7 +244,7 @@ shields:
     detect_behavior_directives: true
 ```
 
-## Memory Guard — Command Reference (2134+ lines, 16 commands)
+## Memory Guard — Command Reference (2765+ lines, 19 commands)
 
 `memory_guard.py` is the standalone runtime security module. Zero required external dependencies (pure Python stdlib). Semantic embedding via `sentence-transformers` is optional with graceful degradation.
 
