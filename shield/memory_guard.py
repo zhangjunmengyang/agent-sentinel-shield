@@ -30,6 +30,9 @@ Usage:
     python memory_guard.py trust show <workspace>            # Display trust DAG
     python memory_guard.py trust audit <workspace>           # Audit topology health
     python memory_guard.py trust set <workspace> <from> <to> <weight>  # Set edge weight
+    python memory_guard.py watch start <workspace> [--interval 300]   # Start watch daemon
+    python memory_guard.py watch stop <workspace>                     # Stop watch daemon
+    python memory_guard.py watch status <workspace>                   # Watch daemon status
 """
 
 import hashlib
@@ -37,13 +40,15 @@ import json
 import math
 import os
 import re
+import signal
 import sys
 import subprocess
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # =============================================================
 # Semantic Embedding (optional — graceful fallback to TF-IDF)
@@ -767,6 +772,8 @@ def full_audit(workspace: str):
 DRIFT_BASELINE_STORE = ".shield/drift_baseline.json"
 DRIFT_HISTORY_STORE = ".shield/drift_history.json"
 TRUST_TOPOLOGY_STORE = ".shield/trust_topology.json"
+WATCH_LOG = ".shield/watch.log"
+WATCH_PID = ".shield/watch.pid"
 
 # 5-level drift thresholds — TF-IDF (sparse, vocabulary-dependent)
 DRIFT_THRESHOLDS_TFIDF = {
@@ -1947,6 +1954,595 @@ def trust_set(workspace: str, src: str, dst: str, weight: float):
 
 
 # =============================================================
+# Watch Daemon + Cascade Alert (Phase 2)
+# =============================================================
+
+# Trust score adjustments per drift level
+_TRUST_ADJUSTMENTS = {
+    "green":  +0.02,
+    "yellow":  0.00,
+    "orange": -0.10,
+    "red":    -0.25,
+    "black":   None,  # Special: reset to 0.0
+}
+
+
+def _drift_check_quiet(workspace: str) -> dict:
+    """Run drift check logic and return result dict (no stdout, no sys.exit).
+
+    Returns a result dict with keys: drift_level, overall_similarity, target_file,
+    method, anchor_results, recommendation.
+    Returns None if baseline or target text is missing.
+    """
+    baseline = _load_json(workspace, DRIFT_BASELINE_STORE)
+    if not baseline or "full_text_vector" not in baseline:
+        return None
+
+    target_text = None
+    target_label = None
+
+    # Try session source
+    sess_label, sess_text = _extract_session_assistant_text(workspace)
+    if sess_text:
+        target_text = sess_text
+        target_label = sess_label
+
+    # Fall back to memory
+    if target_text is None:
+        memory_dir = os.path.join(workspace, "memory")
+        if os.path.isdir(memory_dir):
+            memory_files = sorted(
+                [f for f in os.listdir(memory_dir)
+                 if re.match(r"\d{4}-\d{2}-\d{2}\.md$", f)]
+            )
+            if memory_files:
+                latest_file = memory_files[-1]
+                target_path = os.path.join(memory_dir, latest_file)
+                with open(target_path, "r", errors="replace") as f:
+                    target_text = f.read()
+                target_label = f"memory/{latest_file}"
+
+    if target_text is None:
+        return None
+
+    # Determine method
+    use_semantic = (
+        baseline.get("has_semantic", False)
+        and baseline.get("full_embedding")
+        and _load_embedding_model()
+    )
+
+    if use_semantic:
+        method = "semantic"
+        thresholds = DRIFT_THRESHOLDS_SEMANTIC
+        target_embedding = _text_to_embedding(target_text)
+        baseline_embedding = baseline["full_embedding"]
+        overall_sim = _cosine_similarity_dense(baseline_embedding, target_embedding)
+        overall_level = _classify_drift_level(overall_sim, thresholds)
+
+        anchor_results = []
+        for anchor in baseline.get("anchors", []):
+            anchor_emb = anchor.get("embedding", [])
+            if anchor_emb:
+                sim = _cosine_similarity_dense(anchor_emb, target_embedding)
+            else:
+                anchor_vec = anchor.get("vector", {})
+                target_vector = _text_to_tfidf_vector(target_text)
+                sim = _cosine_similarity(anchor_vec, target_vector)
+            anchor_thresh = DRIFT_THRESHOLDS_ANCHOR if len(anchor["text"]) < 50 else thresholds
+            level = _classify_drift_level(sim, anchor_thresh)
+            anchor_results.append({
+                "text": anchor["text"],
+                "similarity": round(sim, 4),
+                "level": level,
+            })
+    else:
+        method = "tfidf"
+        thresholds = DRIFT_THRESHOLDS_TFIDF
+        target_vector = _text_to_tfidf_vector(target_text)
+        baseline_vector = baseline["full_text_vector"]
+        overall_sim = _cosine_similarity(baseline_vector, target_vector)
+        overall_level = _classify_drift_level(overall_sim, thresholds)
+
+        anchor_results = []
+        for anchor in baseline.get("anchors", []):
+            anchor_vec = anchor.get("vector", {})
+            sim = _cosine_similarity(anchor_vec, target_vector)
+            level = _classify_drift_level(sim, thresholds)
+            anchor_results.append({
+                "text": anchor["text"],
+                "similarity": round(sim, 4),
+                "level": level,
+            })
+
+    result = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "baseline_hash": baseline.get("source_hash", "unknown"),
+        "target_file": target_label,
+        "method": method,
+        "overall_similarity": round(overall_sim, 4),
+        "drift_level": overall_level,
+        "anchor_results": anchor_results,
+        "recommendation": DRIFT_RECOMMENDATIONS[overall_level],
+    }
+    return result
+
+
+def _get_downstream_agents(topology: dict, agent_name: str) -> list:
+    """Find all downstream agents from the given agent in the trust DAG.
+
+    Downstream = agents that agent_name has edges TO (directly or transitively).
+    Uses BFS to collect transitive downstream nodes.
+    """
+    edges = topology.get("edges", [])
+    # Build adjacency: from -> [to, ...]
+    adj = {}
+    for edge in edges:
+        adj.setdefault(edge["from"], []).append(edge["to"])
+
+    # BFS from agent_name
+    visited = set()
+    queue = list(adj.get(agent_name, []))
+    while queue:
+        node = queue.pop(0)
+        if node in visited:
+            continue
+        visited.add(node)
+        for neighbor in adj.get(node, []):
+            if neighbor not in visited:
+                queue.append(neighbor)
+
+    return list(visited)
+
+
+def _append_watch_log(workspace: str, entry: dict):
+    """Append a JSON line to watch.log."""
+    _ensure_shield_dir(workspace)
+    log_path = os.path.join(workspace, WATCH_LOG)
+    with open(log_path, "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _cascade_alert(workspace: str, agent_name: str, drift_level: str,
+                    trust_score: float, topology: dict) -> list:
+    """Execute Cascade Alert: force drift check on all downstream agents.
+
+    Triggered when:
+      - drift_level is RED or BLACK
+      - trust_score < 0.5
+
+    Returns list of cascade result dicts.
+    """
+    downstream = _get_downstream_agents(topology, agent_name)
+    if not downstream:
+        return []
+
+    cascade_results = []
+    emoji, label, desc = DRIFT_LEVEL_DISPLAY[drift_level]
+
+    print(f"\n  {_COLOR_RED}{'=' * 50}{_COLOR_RESET}")
+    print(f"  {_COLOR_RED}🚨 CASCADE ALERT — Triggered by {agent_name}{_COLOR_RESET}")
+    print(f"  {_COLOR_RED}   Reason: {emoji} {label} (trust={trust_score:.2f}){_COLOR_RESET}")
+    print(f"  {_COLOR_RED}   Downstream agents: {', '.join(downstream)}{_COLOR_RESET}")
+    print(f"  {_COLOR_RED}{'=' * 50}{_COLOR_RESET}")
+
+    agents_data = topology.get("agents", {})
+
+    for downstream_agent in downstream:
+        agent_info = agents_data.get(downstream_agent, {})
+        # Try to find workspace for downstream agent
+        # Convention: agent workspace is adjacent or under ~/.openclaw/agents/<name>/
+        downstream_workspaces = []
+
+        # Check ~/.openclaw/agents/<name>
+        home_agent_dir = os.path.join(os.path.expanduser("~"), ".openclaw", "agents", downstream_agent)
+        if os.path.isdir(home_agent_dir):
+            downstream_workspaces.append(home_agent_dir)
+
+        # Check soul_file path to infer workspace
+        soul_file = agent_info.get("soul_file", "")
+        if soul_file and os.path.isabs(soul_file):
+            candidate = os.path.dirname(soul_file)
+            if os.path.isdir(candidate) and candidate not in downstream_workspaces:
+                downstream_workspaces.append(candidate)
+
+        # Also try the same workspace (multi-agent in one repo)
+        if os.path.exists(os.path.join(workspace, DRIFT_BASELINE_STORE)):
+            downstream_workspaces.append(workspace)
+
+        cascade_entry = {
+            "agent": downstream_agent,
+            "triggered_by": agent_name,
+            "drift_level": None,
+            "trust_score": agent_info.get("trust_score", 0.5),
+            "checked": False,
+        }
+
+        for ws in downstream_workspaces:
+            result = _drift_check_quiet(ws)
+            if result:
+                cascade_entry["drift_level"] = result["drift_level"]
+                cascade_entry["checked"] = True
+                d_emoji, d_label, _ = DRIFT_LEVEL_DISPLAY[result["drift_level"]]
+                print(f"    {d_emoji} {downstream_agent}: {d_label} "
+                      f"(sim={result['overall_similarity']:.4f})")
+                break
+
+        if not cascade_entry["checked"]:
+            print(f"    ⚠️  {downstream_agent}: No baseline — cannot check drift")
+
+        cascade_results.append(cascade_entry)
+
+    return cascade_results
+
+
+def watch_start(workspace: str, interval: int = 300):
+    """Start the watch daemon in foreground.
+
+    Runs a continuous loop that:
+    1. Performs drift check on all registered agents
+    2. Dynamically adjusts trust scores
+    3. Quarantines low-trust agents
+    4. Triggers Cascade Alerts for RED/BLACK drift
+    5. Writes results to watch.log (JSON Lines)
+
+    Supports Ctrl+C for graceful exit.
+
+    Args:
+        workspace: Path to the workspace root.
+        interval: Seconds between check cycles (default 300).
+    """
+    _ensure_shield_dir(workspace)
+
+    # Write PID file for stop command
+    pid_path = os.path.join(workspace, WATCH_PID)
+    with open(pid_path, "w") as f:
+        f.write(str(os.getpid()))
+
+    # Load topology
+    topology = _load_json(workspace, TRUST_TOPOLOGY_STORE)
+    if not topology or "agents" not in topology:
+        print("❌ No trust topology found. Run 'trust init' first.")
+        sys.exit(1)
+
+    agents = topology["agents"]
+    if not agents:
+        print("❌ No agents in trust topology.")
+        sys.exit(1)
+
+    # Graceful shutdown handler
+    shutdown_flag = [False]
+
+    def _signal_handler(signum, frame):
+        shutdown_flag[0] = True
+        print(f"\n\n🛑 Watch daemon shutting down (signal {signum})...")
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    print(f"{'=' * 60}")
+    print(f"🛡️  Shield Watch Daemon v{__version__}")
+    print(f"{'=' * 60}")
+    print(f"  Workspace: {workspace}")
+    print(f"  Interval:  {interval}s")
+    print(f"  Agents:    {len(agents)} ({', '.join(agents.keys())})")
+    print(f"  PID:       {os.getpid()}")
+    print(f"  Log:       {WATCH_LOG}")
+    print(f"  Started:   {datetime.now(timezone.utc).isoformat()}")
+    print(f"{'=' * 60}")
+    print(f"  Press Ctrl+C to stop.\n")
+
+    log_event(workspace, f"Watch daemon started: interval={interval}s, agents={list(agents.keys())}")
+
+    cycle_count = 0
+
+    while not shutdown_flag[0]:
+        cycle_count += 1
+        cycle_start = datetime.now(timezone.utc)
+        print(f"\n{'─' * 50}")
+        print(f"🔄 Cycle #{cycle_count} — {cycle_start.isoformat()[:19]}Z")
+        print(f"{'─' * 50}")
+
+        # Reload topology each cycle (may have been modified externally)
+        topology = _load_json(workspace, TRUST_TOPOLOGY_STORE)
+        if not topology or "agents" not in topology:
+            print("  ⚠️  Topology missing, skipping cycle")
+            time.sleep(interval)
+            continue
+
+        agents = topology["agents"]
+        topology_modified = False
+        cycle_alerts = []
+
+        for agent_name, agent_info in agents.items():
+            if shutdown_flag[0]:
+                break
+
+            current_trust = agent_info.get("trust_score", 0.5)
+            status = agent_info.get("status", "active")
+
+            # Skip quarantined agents (just report them)
+            if status == "quarantine":
+                print(f"  🔒 {agent_name}: QUARANTINED (trust={current_trust:.2f})")
+                continue
+
+            # Determine workspace for this agent
+            # Try multiple locations
+            agent_workspace = None
+            candidates = [
+                workspace,  # Same workspace (most common)
+                os.path.join(os.path.expanduser("~"), ".openclaw", "agents", agent_name),
+            ]
+            soul_file = agent_info.get("soul_file", "")
+            if soul_file and os.path.isabs(soul_file):
+                candidates.append(os.path.dirname(soul_file))
+
+            for candidate in candidates:
+                if os.path.isdir(candidate) and os.path.exists(
+                    os.path.join(candidate, DRIFT_BASELINE_STORE)
+                ):
+                    agent_workspace = candidate
+                    break
+
+            if not agent_workspace:
+                print(f"  ⚠️  {agent_name}: No drift baseline found, skipping")
+                continue
+
+            # Run drift check
+            result = _drift_check_quiet(agent_workspace)
+            if result is None:
+                print(f"  ⚠️  {agent_name}: Drift check failed (no target text)")
+                continue
+
+            drift_level = result["drift_level"]
+            similarity = result["overall_similarity"]
+            emoji, label, desc = DRIFT_LEVEL_DISPLAY[drift_level]
+
+            # Adjust trust score
+            adjustment = _TRUST_ADJUSTMENTS.get(drift_level, 0)
+            if adjustment is None:
+                # BLACK: reset to 0.0
+                new_trust = 0.0
+            else:
+                new_trust = max(0.0, min(1.0, current_trust + adjustment))
+
+            trust_changed = abs(new_trust - current_trust) > 0.001
+
+            # Update trust in topology
+            if trust_changed:
+                agents[agent_name]["trust_score"] = round(new_trust, 4)
+                topology_modified = True
+
+            # Print status
+            trust_delta = new_trust - current_trust
+            delta_str = ""
+            if trust_changed:
+                sign = "+" if trust_delta > 0 else ""
+                delta_str = f" ({sign}{trust_delta:.2f})"
+            print(f"  {emoji} {agent_name}: {label} "
+                  f"(sim={similarity:.4f}, trust={new_trust:.2f}{delta_str})")
+
+            # Check for quarantine
+            if new_trust < 0.3:
+                agents[agent_name]["status"] = "quarantine"
+                topology_modified = True
+                alert_msg = f"QUARANTINE: {agent_name} trust={new_trust:.2f}"
+                cycle_alerts.append(alert_msg)
+                print(f"    {_COLOR_RED}🔒 QUARANTINED — trust below 0.3{_COLOR_RESET}")
+                log_event(workspace, alert_msg, "CRITICAL")
+
+            # Build log entry
+            log_entry = {
+                "timestamp": result["timestamp"],
+                "cycle": cycle_count,
+                "agent": agent_name,
+                "drift_level": drift_level,
+                "similarity": similarity,
+                "trust_score": round(new_trust, 4),
+                "trust_delta": round(trust_delta, 4) if trust_changed else 0,
+                "alerts": [],
+            }
+
+            # Cascade Alert trigger
+            should_cascade = (
+                drift_level in ("red", "black")
+                or new_trust < 0.5
+            )
+
+            if should_cascade:
+                cascade_reason = (
+                    f"drift={label}" if drift_level in ("red", "black")
+                    else f"trust={new_trust:.2f}"
+                )
+                alert_msg = f"CASCADE: {agent_name} ({cascade_reason})"
+                cycle_alerts.append(alert_msg)
+                log_entry["alerts"].append(alert_msg)
+                log_event(workspace, alert_msg, "CRITICAL")
+
+                cascade_results = _cascade_alert(
+                    workspace, agent_name, drift_level, new_trust, topology
+                )
+                log_entry["cascade"] = cascade_results
+
+            _append_watch_log(workspace, log_entry)
+
+        # Save topology if modified
+        if topology_modified:
+            _save_json(workspace, TRUST_TOPOLOGY_STORE, topology)
+
+        # Cycle summary
+        cycle_duration = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        print(f"\n  ⏱️  Cycle #{cycle_count} completed in {cycle_duration:.1f}s")
+        if cycle_alerts:
+            print(f"  🚨 Alerts: {len(cycle_alerts)}")
+            for alert in cycle_alerts:
+                print(f"     • {alert}")
+        else:
+            print(f"  ✅ No alerts")
+        print(f"  💤 Next cycle in {interval}s...")
+
+        # Sleep with shutdown check (check every 1s for responsiveness)
+        for _ in range(interval):
+            if shutdown_flag[0]:
+                break
+            time.sleep(1)
+
+    # Cleanup
+    print(f"\n{'=' * 60}")
+    print(f"🛡️  Watch daemon stopped after {cycle_count} cycle(s).")
+    print(f"{'=' * 60}")
+    log_event(workspace, f"Watch daemon stopped after {cycle_count} cycles")
+
+    # Remove PID file
+    if os.path.exists(pid_path):
+        os.remove(pid_path)
+
+
+def watch_stop(workspace: str):
+    """Stop a running watch daemon by sending SIGTERM to the PID.
+
+    Reads the PID from .shield/watch.pid and sends SIGTERM.
+    """
+    pid_path = os.path.join(workspace, WATCH_PID)
+    if not os.path.exists(pid_path):
+        print("❌ No watch process running (no PID file found)")
+        return
+
+    try:
+        with open(pid_path, "r") as f:
+            pid = int(f.read().strip())
+    except (ValueError, IOError):
+        print("❌ Invalid PID file")
+        if os.path.exists(pid_path):
+            os.remove(pid_path)
+        return
+
+    # Check if process is actually running
+    try:
+        os.kill(pid, 0)  # Signal 0 = just check existence
+    except ProcessLookupError:
+        print(f"⚠️  Watch process (PID {pid}) is not running. Cleaning up PID file.")
+        os.remove(pid_path)
+        return
+    except PermissionError:
+        pass  # Process exists but we can't check — try to send signal anyway
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"✅ Sent SIGTERM to watch daemon (PID {pid})")
+        log_event(workspace, f"Watch daemon stop signal sent to PID {pid}")
+    except ProcessLookupError:
+        print(f"⚠️  Process {pid} already exited")
+        if os.path.exists(pid_path):
+            os.remove(pid_path)
+    except PermissionError:
+        print(f"❌ Permission denied to stop PID {pid}")
+
+
+def watch_status(workspace: str):
+    """Display watch daemon status from recent log entries.
+
+    Shows: running state, last check time, agent trust scores, recent alerts.
+    """
+    print(f"\n{'=' * 60}")
+    print(f"🛡️  Shield Watch Status")
+    print(f"{'=' * 60}")
+
+    # Check running state
+    pid_path = os.path.join(workspace, WATCH_PID)
+    running = False
+    pid = None
+    if os.path.exists(pid_path):
+        try:
+            with open(pid_path, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            running = True
+        except (ValueError, ProcessLookupError, PermissionError):
+            running = False
+
+    if running:
+        print(f"  State: {_COLOR_GREEN}● RUNNING{_COLOR_RESET} (PID {pid})")
+    else:
+        print(f"  State: {_COLOR_YELLOW}○ STOPPED{_COLOR_RESET}")
+
+    # Read recent log entries
+    log_path = os.path.join(workspace, WATCH_LOG)
+    if not os.path.exists(log_path):
+        print(f"  Log: No watch log found")
+        print(f"{'=' * 60}")
+        return
+
+    # Read last 10 entries
+    entries = []
+    try:
+        with open(log_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except IOError:
+        print(f"  Log: Cannot read watch log")
+        print(f"{'=' * 60}")
+        return
+
+    recent = entries[-10:]
+
+    if not recent:
+        print(f"  Log: Empty")
+        print(f"{'=' * 60}")
+        return
+
+    # Last check time
+    last_entry = recent[-1]
+    last_time = last_entry.get("timestamp", "unknown")[:19]
+    last_cycle = last_entry.get("cycle", "?")
+    print(f"  Last check: {last_time}Z (cycle #{last_cycle})")
+
+    # Current trust scores (from topology)
+    topology = _load_json(workspace, TRUST_TOPOLOGY_STORE)
+    if topology and "agents" in topology:
+        print(f"\n  Agent Trust Scores:")
+        for name, info in topology["agents"].items():
+            score = info.get("trust_score", 0.0)
+            status = info.get("status", "active")
+            color = _trust_color(score)
+            status_str = f" [{_COLOR_RED}QUARANTINED{_COLOR_RESET}]" if status == "quarantine" else ""
+            print(f"    {color}● {name}: {score:.2f}{_COLOR_RESET}{status_str}")
+
+    # Recent alerts
+    all_alerts = []
+    for entry in recent:
+        for alert in entry.get("alerts", []):
+            all_alerts.append((entry.get("timestamp", "?")[:19], alert))
+
+    if all_alerts:
+        print(f"\n  {_COLOR_RED}Recent Alerts:{_COLOR_RESET}")
+        for ts, alert in all_alerts[-5:]:
+            print(f"    {_COLOR_RED}🚨 [{ts}] {alert}{_COLOR_RESET}")
+    else:
+        print(f"\n  {_COLOR_GREEN}✅ No recent alerts{_COLOR_RESET}")
+
+    # Recent drift levels summary
+    print(f"\n  Recent Checks (last {len(recent)}):")
+    for entry in recent:
+        ts = entry.get("timestamp", "?")[:19]
+        agent = entry.get("agent", "?")
+        level = entry.get("drift_level", "?")
+        trust = entry.get("trust_score", 0)
+        if level in DRIFT_LEVEL_DISPLAY:
+            emoji, label, _ = DRIFT_LEVEL_DISPLAY[level]
+        else:
+            emoji, label = "?", level
+        print(f"    [{ts}] {agent}: {emoji} {label} (trust={trust:.2f})")
+
+    print(f"{'=' * 60}")
+
+
+# =============================================================
 # CLI entry point
 # =============================================================
 
@@ -1970,6 +2566,9 @@ def _print_usage():
     print("  python memory_guard.py trust show <workspace>")
     print("  python memory_guard.py trust audit <workspace>")
     print("  python memory_guard.py trust set <workspace> <from> <to> <weight>")
+    print("  python memory_guard.py watch start <workspace> [--interval 300]")
+    print("  python memory_guard.py watch stop <workspace>")
+    print("  python memory_guard.py watch status <workspace>")
     print()
     print("Source types: owner_direct, agent_self, agent_peer, external_tool, web_scrape, unknown")
 
@@ -2064,6 +2663,38 @@ def main():
         else:
             print(f"❌ Unknown trust subcommand: {subcommand}")
             print("   Valid: trust init, trust show, trust audit, trust set")
+            sys.exit(1)
+        sys.exit(0)
+
+    # Handle 'watch' subcommand (watch <start|stop|status> <workspace> [options])
+    if command == "watch":
+        if len(sys.argv) < 4:
+            print("❌ Usage: memory_guard.py watch <start|stop|status> <workspace> [options]")
+            sys.exit(1)
+        subcommand = sys.argv[2]
+        workspace = os.path.expanduser(sys.argv[3])
+        if not os.path.isdir(workspace):
+            print(f"❌ Workspace not found: {workspace}")
+            sys.exit(1)
+        extra_args = sys.argv[4:]
+
+        if subcommand == "start":
+            interval = 300
+            for i, arg in enumerate(extra_args):
+                if arg == "--interval" and i + 1 < len(extra_args):
+                    try:
+                        interval = int(extra_args[i + 1])
+                    except ValueError:
+                        print(f"❌ Interval must be an integer, got: {extra_args[i + 1]}")
+                        sys.exit(1)
+            watch_start(workspace, interval=interval)
+        elif subcommand == "stop":
+            watch_stop(workspace)
+        elif subcommand == "status":
+            watch_status(workspace)
+        else:
+            print(f"❌ Unknown watch subcommand: {subcommand}")
+            print("   Valid: watch start, watch stop, watch status")
             sys.exit(1)
         sys.exit(0)
 
